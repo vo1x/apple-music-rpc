@@ -100,9 +100,12 @@ class DiscordRPC {
                     state: String? = nil,
                     largeImageKey: String? = nil,
                     largeImageText: String? = nil,
+                    smallImageKey: String? = nil,
+                    smallImageText: String? = nil,
                     startTimestamp: Date? = nil,
                      endTimestamp: Date?=nil,
-                     type: Int? = nil) {
+                     type: Int? = nil,
+                     clearTimestamps: Bool = false) {
         
         guard isConnected else {
             print("Not connected to Discord, cannot set presence.")
@@ -124,7 +127,7 @@ class DiscordRPC {
         }
         
         
-        if largeImageKey != nil || largeImageText != nil {
+        if largeImageKey != nil || largeImageText != nil || smallImageKey != nil || smallImageText != nil {
             var assets: [String: Any] = [:]
             if let key = largeImageKey {
                 assets["large_image"] = key
@@ -132,11 +135,17 @@ class DiscordRPC {
             if let text = largeImageText {
                 assets["large_text"] = text
             }
+            if let key = smallImageKey {
+                assets["small_image"] = key
+            }
+            if let text = smallImageText {
+                assets["small_text"] = text
+            }
             activity["assets"] = assets
         }
         
         
-             if startTimestamp != nil || endTimestamp != nil {
+             if !clearTimestamps && (startTimestamp != nil || endTimestamp != nil) {
                  var timestamps: [String: Any] = [:]
                  if let start = startTimestamp {
                      timestamps["start"] = Int(start.timeIntervalSince1970)

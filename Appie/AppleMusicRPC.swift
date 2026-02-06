@@ -1,14 +1,22 @@
 import Foundation
 import MediaPlayer
 import AppKit
-
-
+import ScriptingBridge
 
 
 class AppleMusicDiscordRPC {
     private let discordRPC: DiscordRPC
     private var timer: Timer?
+    private var positionTimer: Timer?
     private var lastTrackIdentifier: String = ""
+    private var lastNotificationAt: Date?
+    private var lastSuccessfulFetchAt: Date?
+    private var consecutivePollFailures: Int = 0
+    private var lastPositionSeconds: Double = 0
+    private var lastIsPlaying: Bool = false
+    private var lastPositionUpdateAt: Date?
+    private var lastTrackBaseId: String = ""
+    private var notificationObservers: [NSObjectProtocol] = []
     
     var onPermissionError: ((String) -> Void)?
     
@@ -33,6 +41,9 @@ class AppleMusicDiscordRPC {
     func stop() {
         timer?.invalidate()
         timer = nil
+        positionTimer?.invalidate()
+        positionTimer = nil
+        removeMusicObservers()
         discordRPC.disconnect()
     }
     
@@ -53,64 +64,35 @@ class AppleMusicDiscordRPC {
     }
 
     private func startMusicMonitoring() {
+        startMusicObservers()
         updateDiscordPresence()
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.updateDiscordPresence()
+        timer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if let lastNotificationAt = self.lastNotificationAt,
+               Date().timeIntervalSince(lastNotificationAt) < 20 {
+                if self.lastIsPlaying,
+                   let lastPositionUpdateAt = self.lastPositionUpdateAt,
+                   Date().timeIntervalSince(lastPositionUpdateAt) < 10 {
+                    return
+                }
+            }
+            self.updateDiscordPresence()
+        }
+
+        positionTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.lastIsPlaying {
+                self.updateDiscordPresence()
+            }
         }
     }
     
     internal func updateDiscordPresence() {
-        
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
-
-            guard let trackInfo = self.getAppleMusicTrackInfo() else {
-                DispatchQueue.main.async {
-                    self.discordRPC.clearPresence()
-                    self.lastTrackIdentifier = ""
-                    print("No music playing or AppleScript failed to get track info, cleared Discord presence.")
-                }
-                return
-            }
-            
-            
-            print("DEBUG: TrackInfo from AppleScript - Title: '\(trackInfo.title)', Artist: '\(trackInfo.artist)', Duration: \(trackInfo.duration)s, Position: \(trackInfo.position)s, IsPlaying: \(trackInfo.isPlaying)")
-
-
-            let currentTrackIdentifier = "\(trackInfo.title)-\(trackInfo.artist)-\(trackInfo.album)-\(trackInfo.isPlaying)-\(trackInfo.position)"
-            
-            guard currentTrackIdentifier != self.lastTrackIdentifier else {
-                
-                return
-            }
-            
-            print("Now Playing: \(trackInfo.title) by \(trackInfo.artist) (Updating Discord)")
-            
-            let startTimestamp: Date?
-            let endTimestamp: Date?
-            
-            if trackInfo.isPlaying {
-                startTimestamp = Date().addingTimeInterval(-(trackInfo.position))
-                endTimestamp = Date().addingTimeInterval(trackInfo.duration - trackInfo.position)
-            } else {
-                startTimestamp = nil
-                endTimestamp = nil
-            }
-            
-            
-            DispatchQueue.main.async {
-                self.discordRPC.setPresence(
-                    details: trackInfo.title,
-                    state: "\(trackInfo.artist)",
-                    largeImageKey: "apple_music",
-                    largeImageText: trackInfo.album,
-                    startTimestamp: startTimestamp,
-                    endTimestamp: endTimestamp ,
-                    type: 2, // This changes the status type from Playing to Listenin to
-                )
-                
-                self.lastTrackIdentifier = currentTrackIdentifier
-            }
+            print("DEBUG: updateDiscordPresence() called")
+            let trackInfo = self.getAppleMusicTrackInfo()
+            self.applyTrackInfo(trackInfo, source: "poll", forceUpdate: true)
         }
     }
     
@@ -119,84 +101,239 @@ class AppleMusicDiscordRPC {
         lastTrackIdentifier = ""
     }
 
-    private struct AppleScriptTrackInfo {
+    private struct TrackInfo {
         let title: String
         let artist: String
         let album: String
         let isPlaying: Bool
         let duration: Double
         let position: Double
-        let artwork: NSImage?
     }
 
-    private func getAppleMusicTrackInfo() -> AppleScriptTrackInfo? {
-        let appleScript = """
-        tell application "Music"
-            if it is running then
-                if player state is playing then
-                    set currentTrack to current track
-                    set trackName to name of currentTrack
-                    set artistName to artist of currentTrack
-                    set albumName to album of currentTrack
-                    set trackDuration to duration of currentTrack
-                    set playerPosition to player position
-                    return trackName & "||" & artistName & "||" & albumName & "||" & trackDuration & "||" & playerPosition & "||" & "playing"
-                else if player state is paused then
-                    set currentTrack to current track
-                    set trackName to name of currentTrack
-                    set artistName to artist of currentTrack
-                    set albumName to album of currentTrack
-                    set trackDuration to duration of currentTrack
-                    set playerPosition to player position
-                    return trackName & "||" & artistName & "||" & albumName & "||" & trackDuration & "||" & playerPosition & "||" & "paused"
-                end if
-            end if
-        end tell
-        return "NOT_PLAYING"
-        """
-
-        var error: NSDictionary?
-        guard let scriptObject = NSAppleScript(source: appleScript) else {
-            print("AppleScript compilation error.")
+    private func getAppleMusicTrackInfo() -> TrackInfo? {
+        guard let app = SBApplication(bundleIdentifier: "com.apple.Music") else {
+            print("DEBUG: SBApplication(bundleIdentifier:) returned nil")
             return nil
         }
-        
-        let output = scriptObject.executeAndReturnError(&error)
-        
-        if let error = error {
-            let errorNumber = error["NSAppleScriptErrorNumber"] as? Int ?? 0
-            if errorNumber == -1743 { // -1743 is "Automation access denied"
-                print("AppleScript permission error: User needs to grant automation access for 'Music'.")
-                DispatchQueue.main.async { [weak self] in
-                    self?.onPermissionError?("This app needs permission to control Apple Music. Please go to System Settings > Privacy & Security > Automation, find '\(Bundle.main.infoDictionary?["CFBundleName"] as? String ?? "Your App")' and enable the checkbox next to 'Music'.")
+        if app.isRunning == false {
+            print("DEBUG: Music app not running per ScriptingBridge")
+            return nil
+        }
+
+        let rawState = sbValue(app, key: "playerState")
+        let state = parsePlayerState(rawState)
+        if state == "stopped" {
+            print("DEBUG: ScriptingBridge state=stopped raw=\(stringify(rawState))")
+            return nil
+        }
+
+        guard let track = sbValue(app, key: "currentTrack") as? NSObject else {
+            print("DEBUG: ScriptingBridge currentTrack is nil")
+            return nil
+        }
+
+        let title = (sbValue(track, key: "name") as? String) ?? ""
+        if title.isEmpty {
+            print("DEBUG: ScriptingBridge track name is empty")
+            return nil
+        }
+
+        let artist = (sbValue(track, key: "artist") as? String) ?? ""
+        let album = (sbValue(track, key: "album") as? String) ?? ""
+        let rawDuration = sbValue(track, key: "duration")
+        let rawPosition = sbValue(app, key: "playerPosition")
+        let duration = parseDouble(rawDuration)
+        let position = parseDouble(rawPosition)
+        let isPlaying = (state == "playing")
+
+        print("DEBUG: scripting bridge state=\(state) position=\(position) rawState=\(stringify(rawState)) rawPosition=\(stringify(rawPosition))")
+
+        return TrackInfo(
+            title: title,
+            artist: artist,
+            album: album,
+            isPlaying: isPlaying,
+            duration: duration,
+            position: position
+        )
+    }
+
+    private func sbValue(_ object: NSObject, key: String) -> Any? {
+        return object.value(forKey: key)
+    }
+
+    private func parsePlayerState(_ raw: Any?) -> String {
+        if let state = raw as? String { return state }
+        if let state = raw as? NSNumber {
+            let code = state.uint32Value
+            let fourcc = fourCCString(code)
+            switch fourcc {
+            case "kPSP": return "playing"
+            case "kPSp": return "paused"
+            case "kPSS": return "stopped"
+            default:
+                switch state.intValue {
+                case 0: return "stopped"
+                case 1: return "playing"
+                case 2: return "paused"
+                default: return "stopped"
                 }
-            } else {
-                print("AppleScript execution error: \(error)")
             }
-            return nil
         }
-        
-        let result = output.stringValue ?? ""
-        
-        if result == "NOT_PLAYING" { return nil }
+        if let obj = raw as? NSObject,
+           let name = obj.value(forKey: "name") as? String {
+            return name
+        }
+        return "stopped"
+    }
 
-        let parts = result.components(separatedBy: "||")
-        if parts.count == 6 {
-            let title = parts[0]
-            let artist = parts[1]
-            let album = parts[2]
-            let duration = Double(parts[3]) ?? 0
-            let position = Double(parts[4]) ?? 0
-            let isPlayingString = parts[5]
-            let isPlaying = (isPlayingString == "playing")
-            
-            
-            let artwork = getAppleMusicArtwork()
-            
-            return AppleScriptTrackInfo(title: title, artist: artist, album: album, isPlaying: isPlaying, duration: duration, position: position, artwork: artwork)
+    private func parseDouble(_ raw: Any?) -> Double {
+        if let v = raw as? Double { return v }
+        if let v = raw as? NSNumber { return v.doubleValue }
+        if let v = raw as? NSAppleEventDescriptor { return v.doubleValue }
+        return 0
+    }
+
+    private func fourCCString(_ code: UInt32) -> String {
+        let bytes = [
+            UInt8((code >> 24) & 0xFF),
+            UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF),
+            UInt8(code & 0xFF)
+        ]
+        return String(bytes: bytes, encoding: .ascii) ?? "????"
+    }
+
+    private func stringify(_ value: Any?) -> String {
+        guard let value = value else { return "nil" }
+        if let num = value as? NSNumber {
+            return "\(type(of: value)):\(value) fourcc=\(fourCCString(num.uint32Value))"
         }
-        print("AppleScript returned unexpected format for track info: \(result)")
-        return nil
+        return "\(type(of: value)):\(value)"
+    }
+
+    private func startMusicObservers() {
+        let center = DistributedNotificationCenter.default()
+        let names = [
+            Notification.Name("com.apple.iTunes.playerInfo"),
+            Notification.Name("com.apple.Music.playerInfo")
+        ]
+
+        for name in names {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                self?.handlePlayerInfoNotification(notification)
+            }
+            notificationObservers.append(observer)
+        }
+    }
+
+    private func removeMusicObservers() {
+        let center = DistributedNotificationCenter.default()
+        for observer in notificationObservers {
+            center.removeObserver(observer)
+        }
+        notificationObservers.removeAll()
+    }
+
+    private func handlePlayerInfoNotification(_ notification: Notification) {
+        guard let userInfo = notification.userInfo else { return }
+
+        print("DEBUG: playerInfo keys: \(Array(userInfo.keys))")
+
+        let state = (userInfo["Player State"] as? String) ?? ""
+        if state == "Stopped" {
+            clearPresence()
+            return
+        }
+
+        let title = (userInfo["Name"] as? String) ?? ""
+        let artist = (userInfo["Artist"] as? String) ?? ""
+        let album = (userInfo["Album"] as? String) ?? ""
+
+        if title.isEmpty {
+            updateDiscordPresence()
+            return
+        }
+
+        print("DEBUG: notification state=\(state)")
+        lastNotificationAt = Date()
+        updateDiscordPresence()
+    }
+
+    private func applyTrackInfo(_ trackInfo: TrackInfo?, source: String, forceUpdate: Bool) {
+        if trackInfo == nil, source == "poll" {
+            consecutivePollFailures += 1
+            if let lastNotificationAt = lastNotificationAt,
+               Date().timeIntervalSince(lastNotificationAt) < 60 {
+                return
+            }
+            if let lastSuccessfulFetchAt = lastSuccessfulFetchAt,
+               Date().timeIntervalSince(lastSuccessfulFetchAt) < 60,
+               consecutivePollFailures < 3 {
+                return
+            }
+        }
+        guard let trackInfo = trackInfo else {
+            DispatchQueue.main.async {
+                self.discordRPC.clearPresence()
+                self.lastTrackIdentifier = ""
+                print("No music playing or fetch failed (\(source)), cleared Discord presence.")
+            }
+            return
+        }
+
+        consecutivePollFailures = 0
+        lastSuccessfulFetchAt = Date()
+        lastIsPlaying = trackInfo.isPlaying
+
+        print("DEBUG: TrackInfo (\(source)) - Title: '\(trackInfo.title)', Artist: '\(trackInfo.artist)', Duration: \(trackInfo.duration)s, Position: \(trackInfo.position)s, IsPlaying: \(trackInfo.isPlaying)")
+
+        let baseTrackId = "\(trackInfo.title)-\(trackInfo.artist)-\(trackInfo.album)"
+        let currentTrackIdentifier = "\(baseTrackId)-\(trackInfo.isPlaying)"
+        let positionDelta = abs(trackInfo.position - lastPositionSeconds)
+        let shouldUpdateForPosition = trackInfo.isPlaying && positionDelta >= 5
+        guard currentTrackIdentifier != lastTrackIdentifier || forceUpdate || shouldUpdateForPosition else { return }
+
+        print("Now Playing: \(trackInfo.title) by \(trackInfo.artist) (Updating Discord)")
+
+        let startTimestamp: Date?
+        let endTimestamp: Date?
+
+        var effectivePosition = trackInfo.position
+        if trackInfo.isPlaying,
+           !lastIsPlaying,
+           effectivePosition <= 0.1,
+           baseTrackId == lastTrackBaseId,
+           lastPositionSeconds > 0 {
+            effectivePosition = lastPositionSeconds
+        }
+
+        if trackInfo.isPlaying {
+            startTimestamp = Date().addingTimeInterval(-(effectivePosition))
+            endTimestamp = Date().addingTimeInterval(trackInfo.duration - effectivePosition)
+        } else {
+            startTimestamp = nil
+            endTimestamp = nil
+        }
+
+        DispatchQueue.main.async {
+            self.discordRPC.setPresence(
+                details: trackInfo.title,
+                state: "\(trackInfo.artist)",
+                largeImageKey: "apple_music",
+                largeImageText: trackInfo.album,
+                smallImageKey: trackInfo.isPlaying ? nil : "pause",
+                smallImageText: trackInfo.isPlaying ? nil : "Paused",
+                startTimestamp: startTimestamp,
+                endTimestamp: endTimestamp,
+                type: 2,
+                clearTimestamps: false
+            )
+            self.lastTrackIdentifier = currentTrackIdentifier
+            self.lastPositionSeconds = effectivePosition
+            self.lastPositionUpdateAt = Date()
+            self.lastTrackBaseId = baseTrackId
+        }
     }
 
     
